@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DPDK — Data Plane Development Kit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="deck-stage.js"></script>
+
+<script type="application/json" id="speaker-notes">
+[
+  "Today we're going to talk about DPDK — the Data Plane Development Kit. If you've ever wondered why high-performance networking products don't just use the Linux kernel network stack, this talk is for you. We'll cover what DPDK is, why it exists, and when it's the right tool to reach for.",
+
+  "Let's start with scale. Modern NICs ship at 100 gigabits per second. That's not theoretical — that's what you pull out of a box today. At 100 gig with minimum-sized 64-byte packets, you're looking at 148 million packets every second. The Linux kernel's network stack, on a single core, tops out around 1 to 2 million packets per second. That's a gap of nearly two orders of magnitude between what the hardware can push and what the OS can handle.",
+
+  "To understand why DPDK exists, you need to understand what happens to a packet in the Linux kernel. Step one: the packet arrives and the NIC does a DMA write into a ring buffer in kernel memory. Step two: the NIC fires a hardware interrupt — the CPU stops whatever it's doing to service it. Step three: the kernel driver runs a softirq to process the DMA'd data. Step four: the kernel allocates a socket buffer and copies the packet into it. Step five: your application calls recvmsg — that's a syscall, a kernel ring crossing. And finally, step six: your application has the data. Six boundaries. Every single packet.",
+
+  "Let's name the four biggest cost centers. Hardware interrupts: every arriving packet fires an IRQ. The CPU halts its current work, flushes its pipeline, and jumps to the interrupt handler. Context switches: moving between kernel and userspace flushes TLB entries. Post-Spectre mitigations made this substantially worse than it used to be. Memory copies: the kernel copies packet data into socket buffers — that's a cache miss and a memory bus transaction per packet. And syscalls: each recvmsg call is a kernel ring crossing. At 10 million packets per second, that's 10 million syscalls per second, all burning cycles.",
+
+  "Here's the performance reality side by side. Linux kernel stack, single core, best case: about 1.5 million packets per second. DPDK on the same hardware: 80 million packets per second or more. For reference, wire rate at just 10 gigabit — commodity server hardware — is 14.88 million packets per second. The kernel can't reach wire rate at 10 gig. DPDK blows past it. All that difference is the overhead we just described.",
+
+  "DPDK's answer is: move the data plane entirely out of the kernel. The fundamental idea is that instead of the NIC interrupting the CPU, you dedicate a CPU core that does nothing but spin in a tight loop, reading packets directly from the NIC's ring buffer in userspace. No interrupts. No kernel crossings. No copies. This is called poll mode. DPDK is a set of open-source libraries and userspace drivers — originally built by Intel, now maintained by the Linux Foundation — that make this model practical.",
+
+  "Three mechanisms make DPDK fast. Poll Mode Drivers — PMDs — are userspace drivers that expose the NIC's hardware ring buffer directly to your application via memory-mapped I/O. No kernel driver in the path. Second: huge pages. DPDK allocates packet buffers — called mbufs — from 2MB or 1GB hugepage regions. With 4KB pages you'd need thousands of TLB entries to cover the same memory; with hugepages you need a handful. TLB pressure drops to nearly zero. Third: CPU affinity. DPDK pins its worker threads to specific cores and tells the kernel to keep off them via CPU isolation. No preemption, no cache evictions from competing threads, no scheduler jitter.",
+
+  "Here's the before-and-after in one picture. Kernel path: NIC, hardware interrupt, kernel driver with softirq, socket buffer copy, syscall, your app. Seven steps, four of which we'd call expensive. DPDK path: NIC, memory-mapped ring buffer, your app. Three steps. No kernel crossing, no copy. The packet goes from hardware to your code with nothing in between. That simplification is exactly where the performance comes from.",
+
+  "DPDK isn't academic. It's deployed at massive scale in production infrastructure. Cisco, Nokia, and Ericsson use it in their NFV platforms and 5G radio and core network stacks. Every major cloud provider — AWS, Azure, GCP — uses DPDK-based virtual networking for their SDN fabric. OVS-DPDK is the standard datapath for OpenStack and OpenShift. It's a Linux Foundation project with contributions from Intel, Arm, Marvell, and dozens of others. If packets are moving fast somewhere in production, DPDK is almost certainly involved.",
+
+  "Here are the four main use case families. Virtual switches: OVS-DPDK and VPP forward packets between VMs at line rate with sub-microsecond latency — this is the backbone of most private cloud networking. Firewalls and IDS: stateful packet inspection at 40 to 100 gigabits requires hardware-level speed in software — Suricata and Snort 3 both support DPDK PMDs. 5G User Plane Function: the UPF processes every subscriber data packet in a 5G core — latency and throughput requirements make DPDK the standard choice. And packet capture: tools like Zeek use DPDK for full wire-rate capture without dropping packets under load.",
+
+  "DPDK is powerful but it isn't free. The biggest cost is dedicated CPU cores. An lcore spins at 100% CPU utilization all the time, even when there's nothing to process. You cannot share those cores with other workloads. Second: you give up the entire kernel network stack. No TCP, no routing tables, no iptables, no sockets. You build your own protocol handling on top of raw packet buffers. Everything above Ethernet is your responsibility. Third: operational complexity. You need BIOS hugepage configuration, CPU isolation in the kernel command line, NUMA topology awareness, and PMD selection for your specific NIC. It's significant ops overhead compared to a normal Linux network service. The alternative worth knowing about: XDP and AF_XDP give you much of the performance benefit with far less complexity, if your use case fits.",
+
+  "This is your slide. Fill in your specific use case — what problem you're solving, what traffic you're handling, what results you've seen. Walk the team through your implementation details.",
+
+  "To wrap up. The kernel network path exists for general-purpose use — it's correct, portable, and secure, but expensive at high packet rates. DPDK eliminates that expense through three mechanisms: poll mode drivers that bypass interrupts, huge pages that eliminate TLB pressure, and CPU affinity that eliminates preemption. The tradeoff is dedicated hardware and implementation complexity. The rule of thumb: reach for DPDK when throughput is the hard constraint and you can dedicate cores to it. Consider XDP or AF_XDP first if your use case is simpler. Questions?"
+]
+</script>
+
+<style>
+/* ── Design system tokens ───────────────────────────── */
+:root {
+  --brand-mint:    #1EF3A1;
+  --brand-cyan:    #5BE9F5;
+  --brand-violet:  #6B5BFF;
+  --brand-red:     #FF5C7A;
+  --ink-0:  #06081A;
+  --ink-1:  #0A0E2A;
+  --ink-2:  #121845;
+  --ink-3:  #1B2360;
+  --ink-4:  #2A3380;
+  --paper-1: #EAEDFF;
+  --paper-2: #B6BDE6;
+  --paper-3: #7A82B8;
+  --paper-4: #4A5290;
+  --font-display: "Orbitron", system-ui, sans-serif;
+  --font-body:    "Space Grotesk", system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", monospace;
+
+  /* Slide type scale — 1920×1080 */
+  --type-title:    72px;
+  --type-subtitle: 44px;
+  --type-body:     34px;
+  --type-small:    28px;
+  --type-micro:    24px;
+  --type-eyebrow:  24px;
+  --pad-top:   96px;
+  --pad-bot:   72px;
+  --pad-x:    110px;
+  --gap-title:  48px;
+  --gap-item:   28px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── Shared slide elements ──────────────────────────── */
+section {
+  font-family: var(--font-body);
+  color: var(--paper-1);
+  overflow: hidden;
+  background: var(--ink-1);
+}
+
+.bg {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 960px 640px at 82% -8%, rgba(107,91,255,0.30), transparent 58%),
+    radial-gradient(ellipse 560px 380px at 8%  112%, rgba(91,233,245,0.08), transparent 64%),
+    var(--ink-1);
+}
+
+.bg-dark {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 1100px 760px at 50% 50%, rgba(107,91,255,0.22), transparent 62%),
+    var(--ink-2);
+}
+
+.stars { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
+
+.hatch {
+  position: absolute;
+  width: 140px; height: 140px;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(91,233,245,0.38) 0 1.5px,
+    transparent 1.5px 14px
+  );
+  z-index: 1;
+}
+.hatch.tl { top: 68px;    left: 68px; }
+.hatch.br { bottom: 68px; right: 68px; }
+
+.frame {
+  position: absolute; inset: 28px;
+  border: 1px solid rgba(91,233,245,0.32);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.content {
+  position: absolute; inset: 0;
+  padding: var(--pad-top) var(--pad-x) var(--pad-bot);
+  display: flex;
+  flex-direction: column;
+  z-index: 2;
+}
+
+/* ── Typography ─────────────────────────────────────── */
+.eyebrow {
+  font-family: var(--font-display);
+  font-size: var(--type-eyebrow);
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--brand-cyan);
+  margin-bottom: 24px;
+}
+
+.slide-title {
+  font-family: var(--font-display);
+  font-size: var(--type-title);
+  font-weight: 700;
+  line-height: 1.06;
+  letter-spacing: -0.01em;
+  color: var(--paper-1);
+  margin-bottom: var(--gap-title);
+}
+.slide-title .mint  { color: var(--brand-mint); }
+.slide-title .cyan  { color: var(--brand-cyan); }
+
+/* ── Layout helpers ─────────────────────────────────── */
+.divider {
+  height: 1px;
+  background: rgba(91,233,245,0.22);
+  margin: var(--gap-item) 0;
+}
+
+.num-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px; height: 56px;
+  flex-shrink: 0;
+  border: 1px solid rgba(91,233,245,0.55);
+  font-family: var(--font-mono);
+  font-size: 24px;
+  color: var(--brand-cyan);
+}
+
+.card {
+  background: rgba(18,24,69,0.72);
+  border: 1px solid rgba(91,233,245,0.18);
+  border-radius: 8px;
+  padding: 32px;
+}
+
+.footer {
+  position: absolute;
+  bottom: 36px;
+  left: var(--pad-x);
+  right: var(--pad-x);
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  letter-spacing: 0.1em;
+  color: var(--paper-4);
+  text-transform: uppercase;
+  z-index: 3;
+}
+</style>
+<template id="__bundler_thumbnail">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 56">
+    <rect width="80" height="56" fill="#0A0E2A"/>
+    <text x="40" y="36" text-anchor="middle" font-size="22" font-weight="bold" fill="#1EF3A1" font-family="monospace">DPDK</text>
+  </svg>
+</template>
+</head>
+<body>
+
+<deck-stage width="1920" height="1080">
+
+  <!-- ═══════════════════════════════════════════════════
+       01 COVER
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="01 Cover">
+    <div class="bg"></div>
+    <div class="stars" id="s1"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+
+    <!-- Accent line left -->
+    <div style="position:absolute; top:0; bottom:0; left:68px; width:2px; background:linear-gradient(180deg,transparent,rgba(30,243,161,0.6) 40%,rgba(91,233,245,0.6) 70%,transparent); z-index:2;"></div>
+
+    <div class="content" style="justify-content:center; padding-left:140px;">
+      <div class="eyebrow" style="margin-bottom:36px;">Technical Overview · 2026</div>
+      <div style="font-family:var(--font-display); font-size:144px; font-weight:800; letter-spacing:-0.02em; line-height:1; color:var(--brand-mint); text-shadow:0 0 60px rgba(30,243,161,0.35); margin-bottom:20px;">DPDK</div>
+      <div style="font-family:var(--font-display); font-size:40px; font-weight:500; color:var(--paper-2); letter-spacing:0.06em; margin-bottom:52px;">Data Plane Development Kit</div>
+      <div style="width:520px; height:1px; background:rgba(91,233,245,0.3); margin-bottom:52px;"></div>
+      <div style="font-family:var(--font-body); font-size:var(--type-small); color:var(--paper-3); line-height:1.5; max-width:700px;">Kernel bypass networking — what it is, why it exists, and when to use it</div>
+    </div>
+
+    <!-- Right side decorative grid -->
+    <div style="position:absolute; right:110px; top:50%; transform:translateY(-50%); display:grid; grid-template-columns:repeat(4,1fr); gap:12px; opacity:0.18; z-index:2;">
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;background:var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;background:var(--brand-mint);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+      <div style="width:48px;height:48px;border:1px solid var(--brand-cyan);"></div>
+    </div>
+
+    <div class="footer"><span>DPDK</span><span>Engineering Overview</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       02 THE PROBLEM
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="02 The Problem">
+    <div class="bg"></div>
+    <div class="stars" id="s2"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">The Problem</div>
+      <h2 class="slide-title">Networks are faster than <span class="mint">software</span> can keep up</h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:32px;">
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:64px; font-weight:700; color:var(--brand-mint); line-height:1; text-shadow:0 0 32px rgba(30,243,161,0.3);">100</div>
+          <div style="font-family:var(--font-display); font-size:var(--type-small); color:var(--brand-cyan);">Gbps</div>
+          <div class="divider" style="margin:0;"></div>
+          <div style="font-size:var(--type-micro); color:var(--paper-3); line-height:1.5;">Commodity NIC bandwidth, off-the-shelf today</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:64px; font-weight:700; color:var(--brand-cyan); line-height:1;">148</div>
+          <div style="font-family:var(--font-display); font-size:var(--type-small); color:var(--brand-cyan);">Mpps</div>
+          <div class="divider" style="margin:0;"></div>
+          <div style="font-size:var(--type-micro); color:var(--paper-3); line-height:1.5;">Wire rate at 100GbE with 64-byte packets</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px; opacity:0.7;">
+          <div style="font-family:var(--font-mono); font-size:64px; font-weight:700; color:var(--paper-4); line-height:1;">~1–2</div>
+          <div style="font-family:var(--font-display); font-size:var(--type-small); color:var(--paper-3);">Mpps</div>
+          <div class="divider" style="margin:0;"></div>
+          <div style="font-size:var(--type-micro); color:var(--paper-3); line-height:1.5;">Linux kernel stack, single core, best case</div>
+        </div>
+
+      </div>
+      <div style="margin-top:44px; padding:24px 32px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.18); border-radius:8px;">
+        <span style="font-size:var(--type-small); color:var(--paper-2);">The gap between hardware capability and kernel throughput is </span><span style="font-size:var(--type-small); color:var(--brand-mint); font-weight:600;">nearly two orders of magnitude</span>
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>The Problem</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       03 THE KERNEL PATH
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="03 The Kernel Path">
+    <div class="bg"></div>
+    <div class="stars" id="s3"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">The Kernel Path</div>
+      <h2 class="slide-title" style="font-size:60px; margin-bottom:36px;">Every packet crosses <span class="mint">six boundaries</span></h2>
+
+      <!-- Flow diagram -->
+      <div style="display:flex; align-items:stretch; gap:0; flex:1; align-content:center; align-items:center;">
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.12em;">[ 01 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px;">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:8px;">NIC</div>
+            <div style="font-size:var(--type-micro); color:var(--paper-3);">Packet arrives</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; padding:0 10px; padding-top:32px;">
+          <div style="font-size:32px; color:var(--brand-cyan);">→</div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.9); letter-spacing:0.12em;">[ 02 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px; border-color:rgba(255,92,122,0.35); background:rgba(255,92,122,0.07);">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:8px;">HW Interrupt</div>
+            <div style="font-size:var(--type-micro); color:rgba(255,92,122,0.9);">CPU stops</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; padding:0 10px; padding-top:32px;">
+          <div style="font-size:32px; color:var(--brand-cyan);">→</div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.12em;">[ 03 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px;">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:8px;">Kernel Driver</div>
+            <div style="font-size:var(--type-micro); color:var(--paper-3);">DMA + softirq</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; padding:0 10px; padding-top:32px;">
+          <div style="font-size:32px; color:var(--brand-cyan);">→</div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.9); letter-spacing:0.12em;">[ 04 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px; border-color:rgba(255,92,122,0.35); background:rgba(255,92,122,0.07);">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:8px;">Socket Buffer</div>
+            <div style="font-size:var(--type-micro); color:rgba(255,92,122,0.9);">Memory copy</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; padding:0 10px; padding-top:32px;">
+          <div style="font-size:32px; color:var(--brand-cyan);">→</div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.9); letter-spacing:0.12em;">[ 05 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px; border-color:rgba(255,92,122,0.35); background:rgba(255,92,122,0.07);">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:8px;">Syscall</div>
+            <div style="font-size:var(--type-micro); color:rgba(255,92,122,0.9);">Ring crossing</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; padding:0 10px; padding-top:32px;">
+          <div style="font-size:32px; color:var(--brand-cyan);">→</div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px; flex:1;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-mint); letter-spacing:0.12em;">[ 06 ]</div>
+          <div class="card" style="width:100%; text-align:center; padding:22px 14px; border-color:rgba(30,243,161,0.35);">
+            <div style="font-family:var(--font-display); font-size:26px; color:var(--brand-mint); margin-bottom:8px;">Your App</div>
+            <div style="font-size:var(--type-micro); color:var(--paper-3);">Finally here</div>
+          </div>
+        </div>
+
+      </div>
+
+      <div style="margin-top:36px; display:flex; gap:36px; align-items:center;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div style="width:16px; height:16px; background:rgba(255,92,122,0.35); border:1px solid rgba(255,92,122,0.7); border-radius:3px;"></div>
+          <span style="font-size:var(--type-micro); color:var(--paper-3);">Performance cost</span>
+        </div>
+        <span style="font-size:var(--type-micro); color:var(--paper-3);">Three of six steps burn significant CPU — at millions of packets per second, this dominates your workload</span>
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Kernel Network Path</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       04 OVERHEAD
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="04 Overhead">
+    <div class="bg"></div>
+    <div class="stars" id="s4"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Overhead</div>
+      <h2 class="slide-title">Four tax points on <span class="mint">every packet</span></h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:32px;">
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile" style="border-color:rgba(255,92,122,0.6); color:rgba(255,92,122,0.9);">01</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Hardware Interrupt</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Every arriving packet fires an IRQ. The CPU halts its current work, flushes its pipeline, and jumps to the interrupt handler. Per-packet cost.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile" style="border-color:rgba(255,92,122,0.6); color:rgba(255,92,122,0.9);">02</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Context Switch</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Kernel ↔ userspace transitions flush TLB entries. Post-Spectre/Meltdown mitigations made this substantially worse than it used to be.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile" style="border-color:rgba(255,92,122,0.6); color:rgba(255,92,122,0.9);">03</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Memory Copy</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">The kernel copies packet data into socket buffers before your code can read it. Every copy is a cache miss and a memory bus transaction.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile" style="border-color:rgba(255,92,122,0.6); color:rgba(255,92,122,0.9);">04</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Syscall Per Packet</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Each <span style="font-family:var(--font-mono); color:var(--brand-cyan); font-size:0.9em;">recvmsg()</span> is a kernel ring crossing. At 10 Mpps that's 10 million syscalls per second, all burning cycles.</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Kernel Overhead</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       05 PERFORMANCE GAP  (different bg)
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="05 Performance Gap" style="background:var(--ink-2);">
+    <div class="bg-dark"></div>
+    <div class="stars" id="s5"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content" style="justify-content:center; align-items:center; text-align:center;">
+      <div class="eyebrow" style="margin-bottom:56px;">Performance Gap</div>
+
+      <div style="display:flex; align-items:flex-end; justify-content:center; gap:96px;">
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:16px;">
+          <div style="font-family:var(--font-mono); font-size:108px; font-weight:700; color:var(--paper-4); line-height:1;">~1.5</div>
+          <div style="font-family:var(--font-display); font-size:32px; color:var(--paper-3);">Mpps</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3);">Linux kernel stack</div>
+        </div>
+
+        <div style="font-family:var(--font-display); font-size:80px; font-weight:600; color:var(--brand-cyan); padding-bottom:44px;">vs</div>
+
+        <div style="display:flex; flex-direction:column; align-items:center; gap:16px;">
+          <div style="font-family:var(--font-mono); font-size:108px; font-weight:700; color:var(--brand-mint); line-height:1; text-shadow:0 0 48px rgba(30,243,161,0.45);">80+</div>
+          <div style="font-family:var(--font-display); font-size:32px; color:var(--brand-cyan);">Mpps</div>
+          <div style="font-size:var(--type-small); color:var(--paper-2);">DPDK, single core</div>
+        </div>
+
+      </div>
+
+      <div style="width:640px; height:1px; background:rgba(91,233,245,0.22); margin:52px auto;"></div>
+
+      <div style="font-size:var(--type-small); color:var(--paper-3);">Wire rate at 10GbE — 64-byte packets: <span style="font-family:var(--font-mono); color:var(--brand-cyan);">14.88 Mpps</span> — the kernel can't reach it; DPDK exceeds it 5×</div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Performance Gap</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       06 ENTER DPDK
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="06 Enter DPDK">
+    <div class="bg"></div>
+    <div class="stars" id="s6"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">The Solution</div>
+      <h2 class="slide-title" style="font-size:64px;">DPDK moves the data plane <span class="mint">out of the kernel</span></h2>
+      <div style="display:grid; grid-template-columns:1.3fr 1fr; gap:72px; align-items:start;">
+
+        <div>
+          <div style="font-size:var(--type-body); color:var(--paper-2); line-height:1.6; margin-bottom:40px;">An open-source set of libraries and userspace drivers for fast packet processing. Built by Intel, now a Linux Foundation project maintained at dpdk.org.</div>
+          <div style="display:flex; flex-direction:column; gap:22px;">
+            <div style="display:flex; align-items:center; gap:20px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Bypasses the kernel network stack entirely</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:20px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Polls the NIC directly — no interrupts</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:20px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Zero-copy packet buffers via huge pages</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:20px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Dedicated CPU cores — no preemption</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Code block -->
+        <div style="font-family:var(--font-mono); font-size:26px; line-height:2; color:var(--brand-cyan); background:rgba(6,8,26,0.85); border:1px solid rgba(91,233,245,0.25); border-radius:8px; padding:36px 40px;">
+          <span style="color:var(--paper-4);">/* The core loop */</span><br>
+          <span style="color:var(--paper-2);">while</span> (running) {<br>
+          <span style="padding-left:2em; display:block;">nb_rx = <span style="color:var(--brand-mint);">rte_eth_rx_burst</span>(</span>
+          <span style="padding-left:4em; display:block;">port, queue,</span>
+          <span style="padding-left:4em; display:block;">pkts, BURST_SIZE</span>
+          <span style="padding-left:2em; display:block;">);</span>
+          <span style="padding-left:2em; display:block; color:var(--paper-4);">// no syscall needed</span>
+          <span style="padding-left:2em; display:block;"><span style="color:var(--brand-mint);">process</span>(pkts, nb_rx);</span>
+          }
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>What is DPDK</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       07 THREE KEY IDEAS
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="07 Three Key Ideas">
+    <div class="bg"></div>
+    <div class="stars" id="s7"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Architecture</div>
+      <h2 class="slide-title">Three mechanisms that <span class="mint">eliminate overhead</span></h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:32px; flex:1;">
+
+        <div class="card" style="display:flex; flex-direction:column; gap:24px; border-top:3px solid var(--brand-mint);">
+          <div style="display:flex; align-items:center; gap:18px; margin-top:8px;">
+            <div class="num-tile" style="border-color:var(--brand-mint); color:var(--brand-mint);">01</div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1);">Poll Mode Driver</div>
+          </div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">A dedicated userspace thread polls the NIC's RX ring in a tight loop. The NIC exposes its ring buffer directly via memory-mapped I/O — no kernel driver, no interrupts.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-mint); letter-spacing:0.06em;">No interrupts</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:24px; border-top:3px solid var(--brand-cyan);">
+          <div style="display:flex; align-items:center; gap:18px; margin-top:8px;">
+            <div class="num-tile" style="border-color:var(--brand-cyan); color:var(--brand-cyan);">02</div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1);">Huge Pages</div>
+          </div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">Packet buffers (mbufs) live in 2MB or 1GB hugepage regions. Far fewer TLB entries needed for the same memory range — TLB pressure drops to nearly zero under high packet rates.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.06em;">No TLB pressure</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:24px; border-top:3px solid var(--brand-violet);">
+          <div style="display:flex; align-items:center; gap:18px; margin-top:8px;">
+            <div class="num-tile" style="border-color:var(--brand-violet); color:#a599ff;">03</div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1);">CPU Affinity</div>
+          </div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">DPDK pins lcore threads to specific cores and uses the kernel's <span style="font-family:var(--font-mono); color:var(--brand-cyan); font-size:0.9em;">isolcpus</span> parameter to prevent any other thread from touching them. No preemption, no cache eviction.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:#a599ff; letter-spacing:0.06em;">No preemption</div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Core Architecture</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       08 BEFORE vs AFTER
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="08 Before vs After">
+    <div class="bg"></div>
+    <div class="stars" id="s8"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">The Difference</div>
+      <h2 class="slide-title" style="font-size:60px; margin-bottom:36px;">Kernel path vs. <span class="mint">DPDK path</span></h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:56px; flex:1;">
+
+        <!-- Left: kernel -->
+        <div>
+          <div style="font-family:var(--font-display); font-size:24px; color:var(--paper-3); letter-spacing:0.06em; text-transform:uppercase; margin-bottom:20px; padding-bottom:14px; border-bottom:1px solid rgba(255,92,122,0.25);">Linux Kernel Stack</div>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(255,92,122,0.06); border:1px solid rgba(255,92,122,0.22); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8); min-width:52px;">NIC</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Hardware</span>
+            </div>
+            <div style="text-align:center; font-size:var(--type-micro); color:rgba(255,92,122,0.7); font-family:var(--font-mono);">↓  DMA write + IRQ fired</div>
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(255,92,122,0.06); border:1px solid rgba(255,92,122,0.22); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8); min-width:52px;">DRV</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Kernel driver + softirq</span>
+            </div>
+            <div style="text-align:center; font-size:var(--type-micro); color:rgba(255,92,122,0.7); font-family:var(--font-mono);">↓  sk_buff alloc + copy</div>
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(255,92,122,0.06); border:1px solid rgba(255,92,122,0.22); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8); min-width:52px;">NET</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Network stack (IP / TCP...)</span>
+            </div>
+            <div style="text-align:center; font-size:var(--type-micro); color:rgba(255,92,122,0.7); font-family:var(--font-mono);">↓  recvmsg() syscall + copy</div>
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(255,92,122,0.06); border:1px solid rgba(255,92,122,0.22); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8); min-width:52px;">APP</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Your application</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: DPDK -->
+        <div>
+          <div style="font-family:var(--font-display); font-size:24px; color:var(--brand-mint); letter-spacing:0.06em; text-transform:uppercase; margin-bottom:20px; padding-bottom:14px; border-bottom:1px solid rgba(30,243,161,0.3);">DPDK Path</div>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.28); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-mint); min-width:52px;">NIC</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Hardware</span>
+            </div>
+            <div style="text-align:center; font-size:var(--type-micro); color:var(--brand-cyan); font-family:var(--font-mono);">↓  memory-mapped ring buffer</div>
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.28); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-mint); min-width:52px;">PMD</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-2);">Userspace poll mode driver</span>
+            </div>
+            <div style="text-align:center; font-size:var(--type-micro); color:var(--brand-cyan); font-family:var(--font-mono);">↓  zero-copy burst read</div>
+            <div style="display:flex; align-items:center; gap:16px; padding:14px 20px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.28); border-radius:6px;">
+              <span style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-mint); min-width:52px;">APP</span>
+              <span style="font-size:var(--type-micro); color:var(--paper-1); font-weight:600;">Your application</span>
+            </div>
+          </div>
+          <div style="margin-top:28px; padding:20px 24px; background:rgba(30,243,161,0.06); border:1px solid rgba(30,243,161,0.22); border-radius:8px;">
+            <span style="font-family:var(--font-display); font-size:var(--type-small); color:var(--brand-mint);">5 steps → 3 steps.</span>
+            <span style="font-size:var(--type-small); color:var(--paper-3);"> No interrupts. No kernel crossings. No copies.</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Kernel vs DPDK</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       09 ADOPTION
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="09 Adoption">
+    <div class="bg"></div>
+    <div class="stars" id="s9"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Adoption</div>
+      <h2 class="slide-title">DPDK is <span class="mint">infrastructure-grade</span> software</h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:32px;">
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile">→</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Telecom</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Cisco, Nokia, Ericsson — NFV platforms, 5G radio and core. Nearly every commercial RAN and 5G UPF runs DPDK underneath.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile">→</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Cloud Providers</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">AWS, Azure, GCP use DPDK for their SDN fabric and virtual network overlays. OVS-DPDK is the standard datapath for OpenStack and OpenShift.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile">→</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Security Appliances</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Next-gen firewalls, IDS/IPS, and DDoS mitigation platforms depend on DPDK for stateful inspection at 40–100 Gbps.</div>
+          </div>
+        </div>
+
+        <div class="card" style="display:flex; gap:28px; align-items:flex-start;">
+          <div class="num-tile">→</div>
+          <div>
+            <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-bottom:12px;">Open Source</div>
+            <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.55;">Linux Foundation project. FD.io / VPP, Suricata, Snort 3, OVS, SPDK — all built on or alongside DPDK.</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Who Uses It</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       10 USE CASES
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="10 Use Cases">
+    <div class="bg"></div>
+    <div class="stars" id="s10"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Use Cases</div>
+      <h2 class="slide-title">What you can <span class="mint">build with DPDK</span></h2>
+      <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:28px; flex:1; align-content:start;">
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.14em; text-transform:uppercase;">[ vSwitch ]</div>
+          <div style="font-family:var(--font-display); font-size:30px; color:var(--paper-1); line-height:1.2;">Virtual Switch</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.5;">OVS-DPDK, VPP — forward packets between VMs at line rate with sub-microsecond latency.</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.14em; text-transform:uppercase;">[ NGFW ]</div>
+          <div style="font-family:var(--font-display); font-size:30px; color:var(--paper-1); line-height:1.2;">Firewall / IDS</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.5;">Stateful inspection at 40–100 Gbps. Suricata and Snort 3 support DPDK PMDs natively.</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.14em; text-transform:uppercase;">[ 5G UPF ]</div>
+          <div style="font-family:var(--font-display); font-size:30px; color:var(--paper-1); line-height:1.2;">5G Core</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.5;">User Plane Function — every subscriber data packet. Low latency + high throughput is mandatory.</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:20px;">
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.14em; text-transform:uppercase;">[ TAP ]</div>
+          <div style="font-family:var(--font-display); font-size:30px; color:var(--paper-1); line-height:1.2;">Packet Capture</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.5;">Full wire-rate capture, zero drops. Zeek, custom probes, and monitoring tools rely on DPDK PMDs.</div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Use Cases</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       11 TRADEOFFS
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="11 Tradeoffs">
+    <div class="bg"></div>
+    <div class="stars" id="s11"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Tradeoffs</div>
+      <h2 class="slide-title">DPDK is a <span class="mint">deliberate tradeoff,</span> not a free lunch</h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:32px;">
+
+        <div class="card" style="display:flex; flex-direction:column; gap:22px; border-top:3px solid rgba(255,92,122,0.7);">
+          <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-top:8px;">Dedicated Cores</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">An lcore spins at 100% CPU utilization even when idle. These cores can't be shared with other workloads. You need dedicated hardware.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8);">CPU always at 100%</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:22px; border-top:3px solid rgba(255,92,122,0.7);">
+          <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-top:8px;">No Kernel Stack</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">No TCP/IP, no routing tables, no iptables, no sockets. You build your own protocol handling. Everything above Ethernet is your responsibility.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8);">No free TCP/UDP</div>
+        </div>
+
+        <div class="card" style="display:flex; flex-direction:column; gap:22px; border-top:3px solid rgba(255,92,122,0.7);">
+          <div style="font-family:var(--font-display); font-size:28px; color:var(--paper-1); margin-top:8px;">Operational Cost</div>
+          <div style="font-size:var(--type-small); color:var(--paper-3); line-height:1.6; flex:1;">BIOS hugepage config, CPU isolation, NUMA topology, PMD selection per NIC — significant ops overhead vs. a normal Linux network service.</div>
+          <div style="font-family:var(--font-mono); font-size:var(--type-micro); color:rgba(255,92,122,0.8);">Complex to operate</div>
+        </div>
+
+      </div>
+      <div style="margin-top:36px; padding:24px 32px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.2); border-radius:8px;">
+        <span style="font-size:var(--type-small); color:var(--paper-2);">Consider <span style="font-family:var(--font-mono); color:var(--brand-cyan);">XDP</span> / <span style="font-family:var(--font-mono); color:var(--brand-cyan);">AF_XDP</span> first — much of the performance benefit, far less complexity. Reach for DPDK when those hit their limit.</span>
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Tradeoffs</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       12 OUR IMPLEMENTATION  (template slide)
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="12 Our Implementation" style="background:var(--ink-2);">
+    <div style="position:absolute; inset:0; background:radial-gradient(ellipse 860px 620px at 74% 18%, rgba(107,91,255,0.24), transparent 58%), var(--ink-2);"></div>
+    <div class="stars" id="s12"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Our Implementation</div>
+      <h2 class="slide-title">How we use DPDK <span class="mint">today</span></h2>
+      <div style="display:grid; grid-template-columns:1.25fr 1fr; gap:64px; align-items:start;">
+
+        <div style="display:flex; flex-direction:column; gap:32px;">
+          <!-- filler description box -->
+          <div style="padding:24px 28px; background:rgba(30,243,161,0.04); border:1px dashed rgba(30,243,161,0.22); border-radius:8px; font-size:var(--type-small); color:var(--paper-3); line-height:1.6; font-style:italic;">
+            Describe your use case here — what problem you are solving, what type of traffic, at what scale.
+          </div>
+          <!-- filler numbered points -->
+          <div style="display:flex; flex-direction:column; gap:20px;">
+            <div style="display:flex; align-items:flex-start; gap:22px;">
+              <div class="num-tile" style="width:48px; height:48px; font-size:var(--type-micro); flex-shrink:0;">01</div>
+              <div>
+                <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:6px;">[ First key point ]</div>
+                <div style="font-size:var(--type-micro); color:var(--paper-3);">Replace with your first implementation detail.</div>
+              </div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:22px;">
+              <div class="num-tile" style="width:48px; height:48px; font-size:var(--type-micro); flex-shrink:0;">02</div>
+              <div>
+                <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:6px;">[ Second key point ]</div>
+                <div style="font-size:var(--type-micro); color:var(--paper-3);">Replace with your second implementation detail.</div>
+              </div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:22px;">
+              <div class="num-tile" style="width:48px; height:48px; font-size:var(--type-micro); flex-shrink:0;">03</div>
+              <div>
+                <div style="font-family:var(--font-display); font-size:26px; color:var(--paper-1); margin-bottom:6px;">[ Third key point ]</div>
+                <div style="font-size:var(--type-micro); color:var(--paper-3);">Replace with your third implementation detail.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:28px;">
+          <div class="card" style="display:flex; flex-direction:column; gap:14px;">
+            <div style="font-family:var(--font-display); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.06em;">[ Key Result ]</div>
+            <div style="font-family:var(--font-mono); font-size:64px; font-weight:700; color:var(--brand-mint); line-height:1; text-shadow:0 0 28px rgba(30,243,161,0.3);">—</div>
+            <div style="font-size:var(--type-micro); color:var(--paper-3);">Replace with your headline number or metric.</div>
+          </div>
+          <div class="card" style="display:flex; flex-direction:column; gap:14px;">
+            <div style="font-family:var(--font-display); font-size:var(--type-micro); color:var(--brand-cyan); letter-spacing:0.06em;">[ Stack ]</div>
+            <div style="font-size:var(--type-micro); color:var(--paper-3); line-height:1.7;">
+              <span style="color:var(--paper-2);">NIC:</span> — <br>
+              <span style="color:var(--paper-2);">DPDK:</span> — <br>
+              <span style="color:var(--paper-2);">OS:</span> — <br>
+              <span style="color:var(--paper-2);">Hardware:</span> —
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Our Implementation</span></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════
+       13 SUMMARY
+  ═══════════════════════════════════════════════════ -->
+  <section data-label="13 Summary">
+    <div class="bg"></div>
+    <div class="stars" id="s13"></div>
+    <div class="hatch tl"></div>
+    <div class="hatch br"></div>
+    <div class="frame"></div>
+    <div class="content">
+      <div class="eyebrow">Summary</div>
+      <h2 class="slide-title" style="font-size:60px; margin-bottom:36px;">When to reach for <span class="mint">DPDK</span></h2>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:56px; flex:1; align-content:start;">
+
+        <div>
+          <div style="font-family:var(--font-display); font-size:24px; color:var(--brand-mint); letter-spacing:0.06em; text-transform:uppercase; margin-bottom:22px; padding-bottom:14px; border-bottom:1px solid rgba(30,243,161,0.3);">Reach for DPDK when…</div>
+          <div style="display:flex; flex-direction:column; gap:18px;">
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">You need more than 1–2 Mpps on a single core</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Sub-microsecond latency is a hard requirement</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">You control the hardware and can dedicate cores</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:var(--brand-mint); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Your logic is custom forwarding or protocol processing</span>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div style="font-family:var(--font-display); font-size:24px; color:rgba(255,92,122,0.9); letter-spacing:0.06em; text-transform:uppercase; margin-bottom:22px; padding-bottom:14px; border-bottom:1px solid rgba(255,92,122,0.22);">Don't use DPDK when…</div>
+          <div style="display:flex; flex-direction:column; gap:18px;">
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:rgba(255,92,122,0.8); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">Your traffic fits within kernel stack capacity</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:rgba(255,92,122,0.8); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);"><span style="font-family:var(--font-mono); color:var(--brand-cyan);">XDP</span> / <span style="font-family:var(--font-mono); color:var(--brand-cyan);">AF_XDP</span> would solve the problem with less complexity</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:rgba(255,92,122,0.8); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">You need the OS network stack (TCP, routing, sockets)</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:18px;">
+              <div style="width:8px; height:8px; background:rgba(255,92,122,0.8); border-radius:50%; flex-shrink:0;"></div>
+              <span style="font-size:var(--type-small); color:var(--paper-1);">You can't dedicate cores or afford the ops complexity</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+      <div style="margin-top:36px; padding:24px 32px; background:rgba(30,243,161,0.05); border:1px solid rgba(30,243,161,0.22); border-radius:8px; text-align:center;">
+        <span style="font-family:var(--font-display); font-size:var(--type-small); color:var(--brand-mint);">Eliminate interrupt · copy · syscall overhead</span>
+        <span style="font-size:var(--type-small); color:var(--paper-3);"> — at the cost of dedicated hardware and operational complexity</span>
+      </div>
+    </div>
+    <div class="footer"><span>DPDK</span><span>Summary</span></div>
+  </section>
+
+</deck-stage>
+
+<script>
+// Generate procedural starfield per slide
+(function() {
+  for (var i = 1; i <= 13; i++) {
+    var container = document.getElementById('s' + i);
+    if (!container) continue;
+    var frag = document.createDocumentFragment();
+    for (var j = 0; j < 72; j++) {
+      var star = document.createElement('div');
+      var big = Math.random() > 0.82;
+      star.style.cssText =
+        'position:absolute;' +
+        'width:'  + (big ? '2' : '1') + 'px;' +
+        'height:' + (big ? '2' : '1') + 'px;' +
+        'background:rgba(91,233,245,' + (0.08 + Math.random() * 0.22) + ');' +
+        'border-radius:50%;' +
+        'top:'    + (Math.random() * 100) + '%;' +
+        'left:'   + (Math.random() * 100) + '%;';
+      frag.appendChild(star);
+    }
+    container.appendChild(frag);
+  }
+})();
+</script>
+
+</body>
+</html>
